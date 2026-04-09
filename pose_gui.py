@@ -9,6 +9,27 @@ import glob
 import threading
 import time
 import av  # PyAV - faster video decode than OpenCV
+import tensorflow as tf
+
+
+# Hàm reduce_sum_axis1 tách riêng để dùng custom_objects khi load model
+def reduce_sum_axis1(xin):
+    import tensorflow as tf
+    return tf.reduce_sum(xin, axis=1)
+
+# Định nghĩa attention_block giống như khi train
+def attention_block(inputs):
+    attention = tf.keras.layers.Dense(1, activation='tanh')(inputs)
+    attention = tf.keras.layers.Flatten()(attention)
+    attention = tf.keras.layers.Activation('softmax')(attention)
+    attention = tf.keras.layers.RepeatVector(inputs.shape[-1])(attention)
+    attention = tf.keras.layers.Permute([2, 1])(attention)
+    sent_representation = tf.keras.layers.Multiply()([inputs, attention])
+    sent_representation = tf.keras.layers.Lambda(
+        reduce_sum_axis1,
+        output_shape=lambda s: (s[0], s[2])
+    )(sent_representation)
+    return sent_representation
 
 class TrafficSignDetectorGUI:
     def __init__(self, root):
@@ -16,6 +37,13 @@ class TrafficSignDetectorGUI:
         self.root.title("Traffic Sign Detector - YOLOv8")
         self.root.geometry("1000x700")
         self.root.configure(bg='#2c3e50')
+
+        # LSTM fall detection
+        self.lstm_model = None
+        self.fall_kpt_buffer = []  # buffer lưu keypoints liên tiếp
+        self.SEQUENCE_LENGTH = 30
+        self.NUM_KEYPOINTS = 17
+        self.FALL_THRESHOLD = 0.5  # xác suất fall > threshold thì cảnh báo
 
         # Initialize variables
         self.model = None
@@ -63,8 +91,29 @@ class TrafficSignDetectorGUI:
         self.fps_frame_count = 0
         self.current_fps = 0.0
 
+        # Fall detection state
+        self.fall_detected = False
+        self.last_fall_time = 0
+        self.fall_alert_duration = 3  # seconds
+
         # Setup GUI
         self.setup_gui()
+
+        # Load LSTM fall detection model nếu có
+        try:
+            self.lstm_model = tf.keras.models.load_model(
+                "fall_lstm.h5",
+                compile=False,
+                safe_mode=False,
+                custom_objects={
+                    "attention_block": attention_block,
+                    "reduce_sum_axis1": reduce_sum_axis1
+                }
+            )
+            print("Loaded fall_lstm.h5 for fall detection!")
+        except Exception as e:
+            print(f"Không load được fall_lstm.h5: {e}")
+            self.lstm_model = None
     
     def setup_gui(self):
         # Main title
@@ -394,7 +443,48 @@ class TrafficSignDetectorGUI:
                                     x1, y1 = person[a]
                                     x2, y2 = person[b]
                                     draw.line((x1, y1, x2, y2), fill='yellow', width=4)
-                        self.update_status("Live Camera - pose drawn")
+                            # === LSTM FALL DETECTION ===
+                            if self.lstm_model is not None:
+                                self.fall_kpt_buffer.append(person)
+                                if len(self.fall_kpt_buffer) > self.SEQUENCE_LENGTH:
+                                    self.fall_kpt_buffer.pop(0)
+                                print(f"[DEBUG] Buffer length: {len(self.fall_kpt_buffer)}")
+                                if len(self.fall_kpt_buffer) == self.SEQUENCE_LENGTH:
+                                    seq = np.array(self.fall_kpt_buffer)  # (30, 17, 2)
+                                    print(f"[DEBUG] Buffer sample (first frame): {seq[0]}")
+                                    seq = seq.reshape((1, self.SEQUENCE_LENGTH, self.NUM_KEYPOINTS*2))
+                                    # Normalize từng sequence (min-max)
+                                    min_v = seq.min(axis=1, keepdims=True)
+                                    max_v = seq.max(axis=1, keepdims=True)
+                                    denom = (max_v - min_v)
+                                    denom[denom == 0] = 1
+                                    seq_norm = (seq - min_v) / denom
+                                    pred = self.lstm_model.predict(seq_norm, verbose=0)
+                                    fall_prob = float(pred[0][1])  # index 1 là fall
+                                    print(f"[DEBUG] fall_prob={fall_prob}")
+                                    if fall_prob > self.FALL_THRESHOLD:
+                                        print("[DEBUG] FALL DETECTED!")
+                                        self.fall_detected = True
+                                        self.last_fall_time = time.time()
+                                        try:
+                                            font = ImageFont.truetype("arial.ttf", 32)
+                                        except:
+                                            font = ImageFont.load_default()
+                                        draw.text((20, 60), f"FALL DETECTED! ({fall_prob:.2f})", fill="red", font=font)
+                                        self.update_status(f"FALL DETECTED! ({fall_prob:.2f})")
+                                    elif self.fall_detected and (time.time() - self.last_fall_time < self.fall_alert_duration):
+                                        print("[DEBUG] FALL ALERT (buffered)")
+                                        try:
+                                            font = ImageFont.truetype("arial.ttf", 32)
+                                        except:
+                                            font = ImageFont.load_default()
+                                        draw.text((20, 60), f"FALL DETECTED! ({fall_prob:.2f})", fill="red", font=font)
+                                        self.update_status(f"FALL DETECTED! ({fall_prob:.2f})")
+                                    else:
+                                        print("[DEBUG] NO FALL")
+                                        self.fall_detected = False
+                        if not self.fall_detected:
+                            self.update_status("Live Camera - pose drawn")
                     else:
                         self.update_status("Live Camera - No detections")
                     self.display_image(pil_frame, fast=True)
@@ -858,6 +948,7 @@ class TrafficSignDetectorGUI:
                 ([(11,13),(13,15)], (255,0,0)),     # left leg (đỏ)
                 ([(12,14),(14,16)], (0,128,0)),     # right leg (xanh lá đậm)
             ]
+            fall_detected = False
             if hasattr(self, '_detection_thread') and self._detection_thread is not None:
                 try:
                     results = self.model(frame_rgb, conf=self.confidence_threshold, verbose=False)
@@ -885,6 +976,7 @@ class TrafficSignDetectorGUI:
                                             x2_disp = int(x2 * scale_x)
                                             y2_disp = int(y2 * scale_y)
                                             cv2.line(display_frame, (x1_disp, y1_disp), (x2_disp, y2_disp), color, 6)
+                            # ...existing code...
                 except Exception:
                     pass
 
@@ -936,7 +1028,7 @@ class TrafficSignDetectorGUI:
         """Update status bar"""
         self.status_bar.config(text=message)
         self.root.update_idletasks()
-    
+
     def on_closing(self):
         """Handle application closing - cleanup camera and video"""
         if self.camera_running:
