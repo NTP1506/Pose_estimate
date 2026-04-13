@@ -1105,13 +1105,16 @@ venv/
 .env
 
 # YOLO
-runs/
-pose/
-coco_pose_demo/
-weights/
-*.pt
-*.pth
-*.onnx
+# runs/
+# pose/
+# coco_pose_demo/
+# weights/
+# *.pt
+# *.pth
+# *.onnx
 node_modules/
 annotations_trainval2017/
 val2017/
+fall_sequences/
+Data_Fall/
+.venv/
